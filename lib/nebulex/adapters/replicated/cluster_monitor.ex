@@ -89,7 +89,7 @@ defmodule Nebulex.Adapters.Replicated.ClusterMonitor do
     # push) and a stale view elects extra pushers; `:pg` converges as soon as
     # the connection is up.
     if MapSet.size(new_nodes) > 0 and leader?(pusher_candidates(pg_group, new_nodes)) do
-      Enum.each(new_nodes, &start_push(task_supervisor, &1, adapter_meta))
+      start_pushes(task_supervisor, new_nodes, adapter_meta)
     end
 
     # The view is updated regardless of what the pushes do, so a failing push
@@ -157,17 +157,27 @@ defmodule Nebulex.Adapters.Replicated.ClusterMonitor do
   # gaps.
   defp leader?(candidates), do: node() == Enum.min(candidates)
 
-  # The push runs in its own supervised task, so a failure (the target raising
-  # mid-bootstrap, a dropped connection, a timeout) is reported through the
-  # task and the `:bootstrap` telemetry span's `:exception` event instead of
-  # blocking or corrupting this process.
-  defp start_push(task_supervisor, new_node, adapter_meta) do
+  # The pushes for a join batch run in a supervised task, one target at a
+  # time, so this process never blocks on them and the pusher streams its
+  # cache to one node at a time, as it did when the pushes ran inline.
+  defp start_pushes(task_supervisor, new_nodes, adapter_meta) do
     _ =
       Task.Supervisor.start_child(task_supervisor, fn ->
-        push_to_new_node(new_node, adapter_meta)
+        Enum.each(new_nodes, &push_isolated(task_supervisor, &1, adapter_meta))
       end)
 
     :ok
+  end
+
+  # Each target gets its own unlinked task, awaited before the next one, so a
+  # failure (the target raising mid-bootstrap, a dropped connection, a
+  # timeout) is logged by the task and reported through the `:bootstrap`
+  # telemetry span's `:exception` event without stopping the pushes to the
+  # other joiners in the batch.
+  defp push_isolated(task_supervisor, new_node, adapter_meta) do
+    task_supervisor
+    |> Task.Supervisor.async_nolink(fn -> push_to_new_node(new_node, adapter_meta) end)
+    |> Task.yield(:infinity)
   end
 
   defp maybe_reset_gc_interval(%{cache: cache} = adapter_meta, cluster_nodes) do

@@ -117,8 +117,9 @@ defmodule Nebulex.Adapters.Replicated do
        RPC, using `:put_new` commands — entries are written only if
        the key does not already exist on the new node, preserving any
        data it received via normal replication in the meantime. The
-       push runs in a supervised task; a failure is reported through
-       the `:bootstrap` telemetry span (`:exception` event) and does
+       pushes run in a supervised task, one target at a time; a failure
+       is reported through the `:bootstrap` telemetry span (`:exception`
+       event), does not stop the pushes to the other joiners, and does
        not affect the monitor's cluster view.
     5. If the primary storage adapter is `Nebulex.Adapters.Local`, the
        new node resets the GC interval on all cluster nodes to

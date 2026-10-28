@@ -23,6 +23,7 @@ defmodule Nebulex.Adapters.ReplicatedBootstrapLeaderTest do
   @cache_name :replicated_leader_cache
   @telemetry_prefix Telemetry.default_prefix(ReplicatedCache)
   @bootstrap_start @telemetry_prefix ++ [:bootstrap, :start]
+  @bootstrap_stop @telemetry_prefix ++ [:bootstrap, :stop]
   @bootstrap_exception @telemetry_prefix ++ [:bootstrap, :exception]
 
   # Erlang term order on node names: node1 < node2 < node3 < node4 < primary.
@@ -60,7 +61,7 @@ defmodule Nebulex.Adapters.ReplicatedBootstrapLeaderTest do
     on_exit(fn ->
       _ = ReplicatedCache.put_dynamic_cache(default_dynamic_cache)
 
-      for node <- nodes, suffix <- [:start, :exception] do
+      for node <- nodes, suffix <- [:start, :stop, :exception] do
         _ = rpc(node, :telemetry, :detach, [{__MODULE__, node, suffix}])
       end
 
@@ -96,6 +97,7 @@ defmodule Nebulex.Adapters.ReplicatedBootstrapLeaderTest do
       %{pg_ref: pg_ref, adapter_meta: %{pg_group: pg_group}} = monitor_state(@node1)
       node2_member = monitor_pid(@node2)
 
+      watch(@node1, :stop)
       watch(@node1, :exception)
 
       # Nodes 2 and 4 restart: their leaves are applied, then both rejoins arrive in one
@@ -109,9 +111,11 @@ defmodule Nebulex.Adapters.ReplicatedBootstrapLeaderTest do
       assert MapSet.member?(view, @node2) == true
       assert MapSet.member?(view, @node4) == true
 
-      # The failure is reported, not swallowed.
+      # The failure is reported, not swallowed, and the other push in the batch completes.
       assert_receive {@bootstrap_exception, _measurements, %{node: @node1, peer: @node4}},
                      @timeout
+
+      assert_receive {@bootstrap_stop, _measurements, %{node: @node1, peer: @node2}}, @timeout
 
       # The monitor is still alive and serving.
       assert monitor_pid(@node1) == monitor
