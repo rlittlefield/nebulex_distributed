@@ -5,12 +5,23 @@ defmodule Nebulex.Adapters.Replicated.ClusterMonitor do
 
   import Nebulex.Utils
 
-  alias Nebulex.Adapters.Replicated.{Bootstrapper, Replicator}
+  alias Nebulex.Adapters.Replicated.Replicator
   alias Nebulex.Distributed.{Cluster, RPC}
   alias Nebulex.Telemetry
 
   # State
-  defstruct [:adapter_meta, :pg_group, :ready_pg_group, :pg_ref, :cluster_nodes, ready?: false]
+  defstruct [
+    :adapter_meta,
+    :pg_group,
+    :ready_pg_group,
+    :pg_ref,
+    :cluster_nodes,
+    :task_supervisor,
+    queue: :queue.new(),
+    queued: MapSet.new(),
+    in_flight: nil,
+    ready?: false
+  ]
 
   ## API
 
@@ -23,6 +34,12 @@ defmodule Nebulex.Adapters.Replicated.ClusterMonitor do
   @spec server_name(map()) :: atom()
   def server_name(%{name: name}) do
     camelize_and_concat([name, ClusterMonitor])
+  end
+
+  @doc false
+  @spec task_supervisor_name(map()) :: atom()
+  def task_supervisor_name(%{name: name}) do
+    camelize_and_concat([name, "BootstrapTasks"])
   end
 
   @doc false
@@ -49,7 +66,8 @@ defmodule Nebulex.Adapters.Replicated.ClusterMonitor do
       pg_group: pg_group,
       ready_pg_group: ready_pg_group,
       pg_ref: pg_ref,
-      cluster_nodes: MapSet.new([node()])
+      cluster_nodes: MapSet.new([node()]),
+      task_supervisor: task_supervisor_name(adapter_meta)
     }
 
     {:ok, state, {:continue, :post_join}}
@@ -84,12 +102,7 @@ defmodule Nebulex.Adapters.Replicated.ClusterMonitor do
   # Existing nodes push their cache entries to the new node (push-based bootstrap).
   def handle_info(
         {pg_ref, :join, pg_group, pids},
-        %__MODULE__{
-          pg_ref: pg_ref,
-          pg_group: pg_group,
-          adapter_meta: adapter_meta,
-          cluster_nodes: cluster_nodes
-        } = state
+        %__MODULE__{pg_ref: pg_ref, pg_group: pg_group, cluster_nodes: cluster_nodes} = state
       ) do
     # Calculate the difference between the new nodes and the cluster nodes
     new_nodes =
@@ -98,18 +111,20 @@ defmodule Nebulex.Adapters.Replicated.ClusterMonitor do
       |> MapSet.new()
       |> MapSet.difference(cluster_nodes)
 
+    # The view is updated regardless of what the pushes do, so a failing push
+    # cannot drop the joined nodes from it.
+    state = %{state | cluster_nodes: MapSet.union(cluster_nodes, new_nodes)}
+
     # The pusher is elected among the nodes `:pg` knows right now, minus the
     # joiners, rather than from this process's view. The view can lag behind
     # `:pg` (events still queued, or an earlier join batch lost to a failed
     # push) and a stale view elects extra pushers; `:pg` converges as soon as
     # the connection is up.
     if MapSet.size(new_nodes) > 0 and leader?(pusher_candidates(state, new_nodes)) do
-      :ok = Bootstrapper.push(adapter_meta, new_nodes)
+      {:noreply, new_nodes |> Enum.reduce(state, &enqueue/2) |> maybe_push_next()}
+    else
+      {:noreply, state}
     end
-
-    # The view is updated regardless of what the pushes do, so a failing push
-    # cannot drop the joined nodes from it.
-    {:noreply, %{state | cluster_nodes: MapSet.union(cluster_nodes, new_nodes)}}
   end
 
   # PG leave event — node(s) left the cluster
@@ -125,6 +140,24 @@ defmodule Nebulex.Adapters.Replicated.ClusterMonitor do
       |> then(&MapSet.difference(cluster_nodes, &1))
 
     {:noreply, %{state | cluster_nodes: updated_nodes}}
+  end
+
+  # The push finished; tell the target it is bootstrapped, then take the next one
+  def handle_info({ref, _total}, %__MODULE__{in_flight: {node, ref}} = state) do
+    _ = Process.demonitor(ref, [:flush])
+    :ok = notify_completed(node, state.adapter_meta)
+
+    {:noreply, maybe_push_next(%{state | in_flight: nil})}
+  end
+
+  # The push failed. The task logged it and the `:bootstrap` span reported it.
+  # The target is not told the bootstrap completed, so it stays out of the
+  # pusher candidates.
+  def handle_info(
+        {:DOWN, ref, :process, _pid, _reason},
+        %__MODULE__{in_flight: {_node, ref}} = state
+      ) do
+    {:noreply, maybe_push_next(%{state | in_flight: nil})}
   end
 
   # Ignore other messages
@@ -188,6 +221,64 @@ defmodule Nebulex.Adapters.Replicated.ClusterMonitor do
   # safe: `:put_new` is idempotent, and anti-entropy repairs any remaining
   # gaps.
   defp leader?(candidates), do: node() == Enum.min(candidates)
+
+  # A node that leaves and rejoins while it is still queued is pushed once
+  defp enqueue(node, %__MODULE__{queue: queue, queued: queued} = state) do
+    if MapSet.member?(queued, node) do
+      state
+    else
+      %{state | queue: :queue.in(node, queue), queued: MapSet.put(queued, node)}
+    end
+  end
+
+  # One push at a time, in arrival order, whatever join events the nodes came
+  # in: `:pg` delivers one event per joiner, so a rollout is many events.
+  defp maybe_push_next(%__MODULE__{in_flight: nil} = state) do
+    case :queue.out(state.queue) do
+      {{:value, node}, queue} ->
+        state = %{state | queue: queue, queued: MapSet.delete(state.queued, node)}
+
+        if node in Cluster.pg_nodes(state.pg_group) do
+          start_push(node, state)
+        else
+          # The node left before its turn
+          maybe_push_next(state)
+        end
+
+      {:empty, _queue} ->
+        state
+    end
+  end
+
+  defp maybe_push_next(%__MODULE__{} = state) do
+    state
+  end
+
+  # The push runs in an unlinked task: a failure surfaces as a `:DOWN` message
+  # here, in the task's log, and in the `:bootstrap` span, not as a crash of
+  # this process and its queue.
+  defp start_push(node, %__MODULE__{task_supervisor: task_supervisor} = state) do
+    task =
+      Task.Supervisor.async_nolink(task_supervisor, __MODULE__, :push_to_new_node, [
+        node,
+        state.adapter_meta
+      ])
+
+    %{state | in_flight: {node, task.ref}}
+  end
+
+  defp notify_completed(node, adapter_meta) do
+    _ =
+      RPC.call(
+        node,
+        __MODULE__,
+        :bootstrap_completed,
+        [adapter_meta],
+        adapter_meta.replication_timeout
+      )
+
+    :ok
+  end
 
   defp maybe_reset_gc_interval(%{cache: cache} = adapter_meta, cluster_nodes) do
     if cache.__primary__().__adapter__() == Nebulex.Adapters.Local do

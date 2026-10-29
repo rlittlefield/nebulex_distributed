@@ -1,7 +1,6 @@
 defmodule Nebulex.Adapters.ReplicatedBootstrapLeaderTest do
   # Covers how `Nebulex.Adapters.Replicated.ClusterMonitor` chooses the bootstrap pusher, how
-  # `Nebulex.Adapters.Replicated.Bootstrapper` runs the pushes, and how both behave when a push
-  # fails.
+  # it runs the pushes, and how it behaves when a push fails.
   #
   # The pusher is elected among the `:pg` members whose own bootstrap has completed, at the
   # time of the join, not from the monitor's own view, so a stale view or a half-filled cache
@@ -14,7 +13,7 @@ defmodule Nebulex.Adapters.ReplicatedBootstrapLeaderTest do
   import Nebulex.CacheCase, only: [wait_until: 1]
 
   alias Nebulex.Adapters.Replicated
-  alias Nebulex.Adapters.Replicated.{Bootstrapper, ClusterMonitor, Replicator}
+  alias Nebulex.Adapters.Replicated.{ClusterMonitor, Replicator}
   alias Nebulex.Distributed.Cluster
   alias Nebulex.Distributed.TestCache.ReplicatedCache
   alias Nebulex.Telemetry
@@ -235,23 +234,52 @@ defmodule Nebulex.Adapters.ReplicatedBootstrapLeaderTest do
     end
   end
 
-  describe "Bootstrapper.push/2" do
+  describe "the push queue" do
     test "pushes one joiner at a time, isolates failures, and skips nodes that left", %{
       adapter_meta: adapter_meta
     } do
       break_bootstrap_on(@node4)
 
       me = node()
-      gone = :"gone@127.0.0.1"
+      monitor = monitor_pid(me)
+      %{pg_ref: pg_ref, pg_group: pg_group} = monitor_state(me)
+
+      [node2_member, node3_member, node4_member] =
+        Enum.map([@node2, @node3, @node4], &monitor_pid/1)
+
+      # Only the local node stays bootstrapped, so it is the pusher for every join below.
+      for node <- Node.list() do
+        :ok =
+          rpc(node, :pg, :leave, [
+            Cluster.pg_scope(),
+            adapter_meta.ready_pg_group,
+            monitor_pid(node)
+          ])
+      end
+
+      wait_until(fn -> assert Cluster.pg_nodes(adapter_meta.ready_pg_group) == [me] end)
+
+      # node2 is gone for good before its join is handled.
+      :ok =
+        rpc(@node2, Supervisor, :stop, [
+          rpc(@node2, Process, :whereis, [@cache_name]),
+          :normal,
+          @timeout
+        ])
+
+      wait_until(fn -> assert @node2 in Cluster.pg_nodes(pg_group) == false end)
 
       watch(me, :start)
       watch(me, :stop)
       watch(me, :exception)
 
-      # node4 raises after a pause; node3 arrives while that push is in flight and waits its
-      # turn; `gone` is not a member any more and is listed twice.
-      :ok = Bootstrapper.push(adapter_meta, [@node4])
-      :ok = Bootstrapper.push(adapter_meta, [@node3, gone, gone])
+      # node4 raises after a pause; node3 and node2 join while that push is in flight and
+      # wait their turn; node3 restarts again meanwhile.
+      send(monitor, {pg_ref, :leave, pg_group, [node3_member, node4_member]})
+      send(monitor, {pg_ref, :join, pg_group, [node4_member]})
+      send(monitor, {pg_ref, :join, pg_group, [node3_member, node2_member]})
+      send(monitor, {pg_ref, :leave, pg_group, [node3_member]})
+      send(monitor, {pg_ref, :join, pg_group, [node3_member]})
 
       assert_receive {@bootstrap_start, _measurements, %{node: ^me, peer: @node4}}, @timeout
       refute_received {@bootstrap_start, _measurements, %{node: ^me, peer: @node3}}
@@ -261,13 +289,13 @@ defmodule Nebulex.Adapters.ReplicatedBootstrapLeaderTest do
 
       assert_receive {@bootstrap_start, _measurements, %{node: ^me, peer: @node3}}, @timeout
       assert_receive {@bootstrap_stop, _measurements, %{node: ^me, peer: @node3}}, @timeout
-      refute_receive {@bootstrap_start, _measurements, %{node: ^me, peer: ^gone}}, 500
+      refute_receive {@bootstrap_start, _measurements, %{node: ^me, peer: @node3}}, 500
+      refute_received {@bootstrap_start, _measurements, %{node: ^me, peer: @node2}}
 
       # Unrelated messages are ignored.
-      bootstrapper = Process.whereis(Bootstrapper.server_name(adapter_meta))
-      send(bootstrapper, :unrelated)
+      send(monitor, :unrelated)
 
-      assert %{in_flight: nil} = :sys.get_state(bootstrapper)
+      assert %{in_flight: nil} = :sys.get_state(monitor)
     end
   end
 
