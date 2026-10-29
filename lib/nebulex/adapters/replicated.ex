@@ -112,9 +112,12 @@ defmodule Nebulex.Adapters.Replicated do
     3. A simple leader election (smallest node name by Erlang term
        ordering among the current `:pg` members whose own bootstrap has
        completed, other than the joiner) ensures exactly one existing
-       node pushes data, avoiding duplicate work. A node that was
-       started alone counts as bootstrapped. If no such member exists,
-       the election falls back to all members.
+       node pushes data, avoiding duplicate work. Only when no member
+       at all is bootstrapped does the election fall back to every
+       member, and the node that then pushes becomes the first
+       bootstrapped member. A node that starts before it is connected
+       to its peers sees them as joiners once the connection is up,
+       finds no candidate, and is pushed to like any other joiner.
     4. The leader queues the push and streams its local cache entries
        to the new node via RPC, one joiner at a time, using `:put_new`
        commands — entries are written only if the key does not already
@@ -124,7 +127,9 @@ defmodule Nebulex.Adapters.Replicated do
        reported through the `:bootstrap` telemetry span (`:exception`
        event), does not stop the pushes to the other joiners, and does
        not affect the monitor's cluster view; the joiner then stays out
-       of the candidates.
+       of the candidates. If a bootstrapped node leaves, the node that
+       leads afterwards queues every member that is not bootstrapped
+       yet, so joiners the leaver still had queued are not stranded.
     5. If the primary storage adapter is `Nebulex.Adapters.Local`, the
        new node resets the GC interval on all cluster nodes to
        synchronize generation rotation and prevent premature eviction.

@@ -4,10 +4,13 @@ defmodule Nebulex.Adapters.ReplicatedBootstrapLeaderTest do
   #
   # The pusher is elected among the `:pg` members whose own bootstrap has completed, at the
   # time of the join, not from the monitor's own view, so a stale view or a half-filled cache
-  # cannot elect a pusher. The view is updated before the pushes run, and the pushes run one at
-  # a time in unlinked tasks, so a push that raises (for example the target raising inside
-  # `apply_bootstrap_entries/2`) is reported through the `:bootstrap` telemetry span, never drops
-  # a joined node from the view, and never stops the pushes to the other joiners.
+  # cannot elect a pusher. A cluster with no bootstrapped member falls back to every member and
+  # the pusher seeds the group. The view is updated before the pushes run, and the pushes run
+  # one at a time in unlinked tasks, so a push that raises (for example the target raising
+  # inside `apply_bootstrap_entries/2`) is reported through the `:bootstrap` telemetry span,
+  # never drops a joined node from the view, and never stops the pushes to the other joiners.
+  # When a bootstrapped node leaves, the node that leads afterwards picks up the members that
+  # are not bootstrapped, so a pusher restarting mid-rollout strands nobody.
   use Nebulex.NodeCase, async: false
 
   import Nebulex.CacheCase, only: [wait_until: 1]
@@ -86,7 +89,8 @@ defmodule Nebulex.Adapters.ReplicatedBootstrapLeaderTest do
       assert primary_count(@node2) >= 1
     end)
 
-    # Every node finished its own bootstrap and is a pusher candidate.
+    # Every node finished its own bootstrap and is a pusher candidate: the first push in the
+    # cluster's life ran as the fallback and seeded the group, the rest were pushed to.
     %{adapter_meta: adapter_meta} = monitor_state(node())
 
     wait_until(fn ->
@@ -206,6 +210,104 @@ defmodule Nebulex.Adapters.ReplicatedBootstrapLeaderTest do
       # The lowest member pushes rather than nobody.
       assert_receive {@bootstrap_start, _measurements, %{node: @node1, peer: @node3}}, @timeout
     end
+
+    test "does not push when it connects to a cluster that has bootstrapped members", %{
+      adapter_meta: adapter_meta
+    } do
+      me = node()
+      monitor = monitor_pid(me)
+      %{pg_ref: pg_ref, pg_group: pg_group} = monitor_state(me)
+
+      # The local node is not bootstrapped (it started before it could connect).
+      :ok = :pg.leave(Cluster.pg_scope(), adapter_meta.ready_pg_group, monitor)
+
+      watch(me, :start)
+
+      # The connection comes up: every peer appears as a joiner at once.
+      peers = Enum.map(Node.list(), &monitor_pid/1)
+      send(monitor, {pg_ref, :leave, pg_group, peers})
+      send(monitor, {pg_ref, :join, pg_group, peers})
+
+      # The peers are bootstrapped, so there is nobody to push to, and the local node is
+      # not elected.
+      refute_receive {@bootstrap_start, _measurements, %{node: ^me}}, 500
+
+      assert %{in_flight: nil} = monitor_state(me)
+    end
+
+    test "becomes bootstrapped itself after pushing as the fallback", %{
+      adapter_meta: adapter_meta
+    } do
+      me = node()
+      monitor = monitor_pid(me)
+      %{pg_ref: pg_ref, pg_group: pg_group} = monitor_state(me)
+
+      # No node is bootstrapped.
+      for node <- [me | Node.list()] do
+        :ok =
+          rpc(node, :pg, :leave, [
+            Cluster.pg_scope(),
+            adapter_meta.ready_pg_group,
+            monitor_pid(node)
+          ])
+      end
+
+      wait_until(fn -> assert Cluster.pg_nodes(adapter_meta.ready_pg_group) == [] end)
+
+      _ = :sys.replace_state(monitor, &%{&1 | ready?: false})
+
+      watch(me, :stop)
+
+      peers = Enum.map(Node.list(), &monitor_pid/1)
+      send(monitor, {pg_ref, :leave, pg_group, peers})
+      send(monitor, {pg_ref, :join, pg_group, peers})
+
+      # The local node is the only candidate, pushes to every peer, and is bootstrapped from
+      # the first completed push on.
+      for peer <- Node.list() do
+        assert_receive {@bootstrap_stop, _measurements, %{node: ^me, peer: ^peer}}, @timeout
+      end
+
+      assert %{ready?: true} = monitor_state(me)
+      assert me in Cluster.pg_nodes(adapter_meta.ready_pg_group)
+    end
+  end
+
+  describe "handle_info/2 on a :leave event of the bootstrapped group" do
+    test "queues the members that are not bootstrapped when it leads afterwards", %{
+      adapter_meta: adapter_meta
+    } do
+      me = node()
+      peers = Node.list()
+
+      # The peers stop reacting, so only the local node can pick up the pushes.
+      for peer <- peers, do: :ok = rpc(peer, :sys, :suspend, [monitor_pid(peer)])
+
+      on_exit(fn ->
+        for peer <- peers, pid = rpc(peer, Process, :whereis, [@cache_name]), is_pid(pid) do
+          _ = rpc(peer, :sys, :resume, [monitor_pid(peer)])
+        end
+      end)
+
+      watch(me, :stop)
+
+      # The bootstrapped peers leave the group one by one, the last of them the pusher.
+      for peer <- peers do
+        :ok =
+          rpc(peer, :pg, :leave, [
+            Cluster.pg_scope(),
+            adapter_meta.ready_pg_group,
+            monitor_pid(peer)
+          ])
+      end
+
+      # The local node leads now and pushes to every member that is not bootstrapped.
+      for peer <- peers do
+        assert_receive {@bootstrap_stop, _measurements, %{node: ^me, peer: ^peer}}, @timeout
+      end
+
+      refute_receive {@bootstrap_stop, _measurements, %{node: ^me}}, 500
+    end
   end
 
   describe "bootstrap_completed/1" do
@@ -214,8 +316,8 @@ defmodule Nebulex.Adapters.ReplicatedBootstrapLeaderTest do
     } do
       watch(@node1, :stop)
 
-      # The local node restarts its cache: it is not alone, so it is bootstrapped by the
-      # leader and only then rejoins the candidates.
+      # The local node restarts its cache: it is bootstrapped by the leader and only then
+      # rejoins the candidates.
       :ok = ReplicatedCache.stop()
       {:ok, _pid} = ReplicatedCache.start_link(name: @cache_name, replication: [interval: 100])
 
@@ -269,13 +371,22 @@ defmodule Nebulex.Adapters.ReplicatedBootstrapLeaderTest do
 
       wait_until(fn -> assert @node2 in Cluster.pg_nodes(pg_group) == false end)
 
+      # Becoming the leader made the local node push to the peers that are not bootstrapped;
+      # let that round finish first.
+      wait_until(fn ->
+        assert %{in_flight: nil, queue: queue} = monitor_state(me)
+        assert :queue.is_empty(queue)
+      end)
+
       watch(me, :start)
       watch(me, :stop)
       watch(me, :exception)
 
       # node4 raises after a pause; node3 and node2 join while that push is in flight and
-      # wait their turn; node3 restarts again meanwhile.
+      # wait their turn; node4 and node3 restart again meanwhile.
       send(monitor, {pg_ref, :leave, pg_group, [node3_member, node4_member]})
+      send(monitor, {pg_ref, :join, pg_group, [node4_member]})
+      send(monitor, {pg_ref, :leave, pg_group, [node4_member]})
       send(monitor, {pg_ref, :join, pg_group, [node4_member]})
       send(monitor, {pg_ref, :join, pg_group, [node3_member, node2_member]})
       send(monitor, {pg_ref, :leave, pg_group, [node3_member]})
@@ -290,6 +401,7 @@ defmodule Nebulex.Adapters.ReplicatedBootstrapLeaderTest do
       assert_receive {@bootstrap_start, _measurements, %{node: ^me, peer: @node3}}, @timeout
       assert_receive {@bootstrap_stop, _measurements, %{node: ^me, peer: @node3}}, @timeout
       refute_receive {@bootstrap_start, _measurements, %{node: ^me, peer: @node3}}, 500
+      refute_received {@bootstrap_start, _measurements, %{node: ^me, peer: @node4}}
       refute_received {@bootstrap_start, _measurements, %{node: ^me, peer: @node2}}
 
       # Unrelated messages are ignored.

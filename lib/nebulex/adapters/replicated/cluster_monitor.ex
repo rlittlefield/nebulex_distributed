@@ -80,19 +80,10 @@ defmodule Nebulex.Adapters.Replicated.ClusterMonitor do
     cluster_nodes = Cluster.pg_nodes(adapter_meta.pg_group)
     :ok = maybe_reset_gc_interval(adapter_meta, cluster_nodes)
 
-    state = %{state | cluster_nodes: MapSet.new(cluster_nodes)}
-
-    # Alone in the group there is nothing to receive, so this node is
-    # bootstrapped and may push to whoever joins next.
-    if cluster_nodes == [node()] do
-      {:noreply, mark_ready(state)}
-    else
-      {:noreply, state}
-    end
+    {:noreply, %{state | cluster_nodes: MapSet.new(cluster_nodes)}}
   end
 
   @impl true
-  def handle_cast(:bootstrap_completed, %__MODULE__{ready?: true} = state), do: {:noreply, state}
   def handle_cast(:bootstrap_completed, %__MODULE__{} = state), do: {:noreply, mark_ready(state)}
 
   @impl true
@@ -142,12 +133,38 @@ defmodule Nebulex.Adapters.Replicated.ClusterMonitor do
     {:noreply, %{state | cluster_nodes: updated_nodes}}
   end
 
-  # The push finished; tell the target it is bootstrapped, then take the next one
+  # A bootstrapped node left. If it was the pusher, whatever it still had
+  # queued or in flight is stranded, and the other nodes decided "not me" for
+  # those joiners when they arrived. The node that leads now queues every
+  # member that is not bootstrapped yet; dedupe and the membership check at
+  # push time keep this cheap when nothing was stranded.
+  def handle_info(
+        {pg_ref, :leave, ready_pg_group, _pids},
+        %__MODULE__{pg_ref: pg_ref, ready_pg_group: ready_pg_group} = state
+      ) do
+    if leader?(pusher_candidates(state, MapSet.new())) do
+      ready = MapSet.new(Cluster.pg_nodes(ready_pg_group))
+
+      state =
+        state.pg_group
+        |> Cluster.pg_nodes()
+        |> Enum.reject(&(&1 == node() or MapSet.member?(ready, &1)))
+        |> Enum.reduce(state, &enqueue/2)
+
+      {:noreply, maybe_push_next(state)}
+    else
+      {:noreply, state}
+    end
+  end
+
+  # The push finished: the target is bootstrapped, and so is this node if it
+  # pushed as the fallback, which seeds the bootstrapped group for a cluster
+  # that has none. Then take the next one.
   def handle_info({ref, _total}, %__MODULE__{in_flight: {node, ref}} = state) do
     _ = Process.demonitor(ref, [:flush])
-    :ok = notify_completed(node, state.adapter_meta)
+    :ok = RPC.cast(node, __MODULE__, :bootstrap_completed, [state.adapter_meta])
 
-    {:noreply, maybe_push_next(%{state | in_flight: nil})}
+    {:noreply, maybe_push_next(mark_ready(%{state | in_flight: nil}))}
   end
 
   # The push failed. The task logged it and the `:bootstrap` span reported it.
@@ -188,23 +205,26 @@ defmodule Nebulex.Adapters.Replicated.ClusterMonitor do
 
   ## Private functions
 
+  defp mark_ready(%__MODULE__{ready?: true} = state), do: state
+
   defp mark_ready(%__MODULE__{ready_pg_group: ready_pg_group} = state) do
     :ok = Cluster.join(ready_pg_group)
 
     %{state | ready?: true}
   end
 
-  # The members whose own bootstrap has completed, except the nodes in the
-  # join batch being handled: a joiner may well have the smallest name, but it
-  # has nothing to push yet. A member still receiving its bootstrap has a
-  # partial cache, so it is not a candidate either. With no such member left
-  # (the cluster lost every bootstrapped node) every member is a candidate,
-  # which at least makes progress; this node is always a member and never a
-  # joiner to itself, so the fallback is never empty.
-  defp pusher_candidates(%__MODULE__{pg_group: pg_group, ready_pg_group: ready_pg_group}, new_nodes) do
-    case members_except(ready_pg_group, new_nodes) do
-      [] -> members_except(pg_group, new_nodes)
-      ready -> ready
+  # The bootstrapped members, except the nodes in the join batch being
+  # handled: a joiner may well have the smallest name, but it has nothing to
+  # push yet. A member still receiving its bootstrap has a partial cache, so
+  # it is not a candidate either. Only a cluster with no bootstrapped member
+  # at all falls back to every member, which at least makes progress; the
+  # pusher then becomes the first bootstrapped member. A node that connects
+  # to a cluster with bootstrapped members sees them as joiners, finds no
+  # candidate, and waits to be pushed to like any other joiner.
+  defp pusher_candidates(%__MODULE__{pg_group: pg_group, ready_pg_group: ready_pg_group}, excluded) do
+    case Cluster.pg_nodes(ready_pg_group) do
+      [] -> members_except(pg_group, excluded)
+      ready -> Enum.reject(ready, &MapSet.member?(excluded, &1))
     end
   end
 
@@ -220,11 +240,13 @@ defmodule Nebulex.Adapters.Replicated.ClusterMonitor do
   # temporarily diverge, the worst case is zero or multiple pushers, both
   # safe: `:put_new` is idempotent, and anti-entropy repairs any remaining
   # gaps.
+  defp leader?([]), do: false
   defp leader?(candidates), do: node() == Enum.min(candidates)
 
-  # A node that leaves and rejoins while it is still queued is pushed once
-  defp enqueue(node, %__MODULE__{queue: queue, queued: queued} = state) do
-    if MapSet.member?(queued, node) do
+  # A node that leaves and rejoins while it is still queued or in flight is
+  # pushed once
+  defp enqueue(node, %__MODULE__{queue: queue, queued: queued, in_flight: in_flight} = state) do
+    if MapSet.member?(queued, node) or match?({^node, _ref}, in_flight) do
       state
     else
       %{state | queue: :queue.in(node, queue), queued: MapSet.put(queued, node)}
@@ -265,19 +287,6 @@ defmodule Nebulex.Adapters.Replicated.ClusterMonitor do
       ])
 
     %{state | in_flight: {node, task.ref}}
-  end
-
-  defp notify_completed(node, adapter_meta) do
-    _ =
-      RPC.call(
-        node,
-        __MODULE__,
-        :bootstrap_completed,
-        [adapter_meta],
-        adapter_meta.replication_timeout
-      )
-
-    :ok
   end
 
   defp maybe_reset_gc_interval(%{cache: cache} = adapter_meta, cluster_nodes) do
