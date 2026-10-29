@@ -5,32 +5,36 @@ defmodule Nebulex.Adapters.Replicated.ClusterMonitor do
 
   import Nebulex.Utils
 
-  alias Nebulex.Adapters.Replicated.Replicator
+  alias Nebulex.Adapters.Replicated.{Bootstrapper, Replicator}
   alias Nebulex.Distributed.{Cluster, RPC}
   alias Nebulex.Telemetry
 
   # State
-  defstruct [:adapter_meta, :pg_group, :pg_ref, :cluster_nodes, :task_supervisor]
+  defstruct [:adapter_meta, :pg_group, :ready_pg_group, :pg_ref, :cluster_nodes, ready?: false]
 
   ## API
 
   @doc false
-  def start_link(%{name: name} = adapter_meta) do
-    name = camelize_and_concat([name, ClusterMonitor])
-
-    GenServer.start_link(__MODULE__, adapter_meta, name: name)
+  def start_link(adapter_meta) do
+    GenServer.start_link(__MODULE__, adapter_meta, name: server_name(adapter_meta))
   end
 
   @doc false
-  @spec task_supervisor_name(map()) :: atom()
-  def task_supervisor_name(%{name: name}) do
-    camelize_and_concat([name, "BootstrapTasks"])
+  @spec server_name(map()) :: atom()
+  def server_name(%{name: name}) do
+    camelize_and_concat([name, ClusterMonitor])
+  end
+
+  @doc false
+  @spec bootstrap_completed(map()) :: :ok
+  def bootstrap_completed(adapter_meta) do
+    GenServer.cast(server_name(adapter_meta), :bootstrap_completed)
   end
 
   ## GenServer Callbacks
 
   @impl true
-  def init(%{pg_group: pg_group} = adapter_meta) do
+  def init(%{pg_group: pg_group, ready_pg_group: ready_pg_group} = adapter_meta) do
     # Trap exit signals to run cleanup on termination
     _ = Process.flag(:trap_exit, true)
 
@@ -43,9 +47,9 @@ defmodule Nebulex.Adapters.Replicated.ClusterMonitor do
     state = %__MODULE__{
       adapter_meta: adapter_meta,
       pg_group: pg_group,
+      ready_pg_group: ready_pg_group,
       pg_ref: pg_ref,
-      cluster_nodes: MapSet.new([node()]),
-      task_supervisor: task_supervisor_name(adapter_meta)
+      cluster_nodes: MapSet.new([node()])
     }
 
     {:ok, state, {:continue, :post_join}}
@@ -58,8 +62,20 @@ defmodule Nebulex.Adapters.Replicated.ClusterMonitor do
     cluster_nodes = Cluster.pg_nodes(adapter_meta.pg_group)
     :ok = maybe_reset_gc_interval(adapter_meta, cluster_nodes)
 
-    {:noreply, %{state | cluster_nodes: MapSet.new(cluster_nodes)}}
+    state = %{state | cluster_nodes: MapSet.new(cluster_nodes)}
+
+    # Alone in the group there is nothing to receive, so this node is
+    # bootstrapped and may push to whoever joins next.
+    if cluster_nodes == [node()] do
+      {:noreply, mark_ready(state)}
+    else
+      {:noreply, state}
+    end
   end
+
+  @impl true
+  def handle_cast(:bootstrap_completed, %__MODULE__{ready?: true} = state), do: {:noreply, state}
+  def handle_cast(:bootstrap_completed, %__MODULE__{} = state), do: {:noreply, mark_ready(state)}
 
   @impl true
   def handle_info(message, state)
@@ -72,8 +88,7 @@ defmodule Nebulex.Adapters.Replicated.ClusterMonitor do
           pg_ref: pg_ref,
           pg_group: pg_group,
           adapter_meta: adapter_meta,
-          cluster_nodes: cluster_nodes,
-          task_supervisor: task_supervisor
+          cluster_nodes: cluster_nodes
         } = state
       ) do
     # Calculate the difference between the new nodes and the cluster nodes
@@ -88,8 +103,8 @@ defmodule Nebulex.Adapters.Replicated.ClusterMonitor do
     # `:pg` (events still queued, or an earlier join batch lost to a failed
     # push) and a stale view elects extra pushers; `:pg` converges as soon as
     # the connection is up.
-    if MapSet.size(new_nodes) > 0 and leader?(pusher_candidates(pg_group, new_nodes)) do
-      start_pushes(task_supervisor, new_nodes, adapter_meta)
+    if MapSet.size(new_nodes) > 0 and leader?(pusher_candidates(state, new_nodes)) do
+      :ok = Bootstrapper.push(adapter_meta, new_nodes)
     end
 
     # The view is updated regardless of what the pushes do, so a failing push
@@ -118,8 +133,9 @@ defmodule Nebulex.Adapters.Replicated.ClusterMonitor do
   end
 
   @impl true
-  def terminate(_reason, %{pg_group: pg_group}) do
-    # Leave the PG group when the process terminates
+  def terminate(_reason, %{pg_group: pg_group, ready_pg_group: ready_pg_group}) do
+    # Leave the PG groups when the process terminates
+    :ok = Cluster.leave(ready_pg_group)
     :ok = Cluster.leave(pg_group)
   end
 
@@ -139,14 +155,30 @@ defmodule Nebulex.Adapters.Replicated.ClusterMonitor do
 
   ## Private functions
 
-  # Every node `:pg` currently knows for the group, except the nodes in the
-  # join batch being handled: a joiner may well have the smallest name, but
-  # it has nothing to push. This node is always a candidate: it is a member
-  # of the group and its own join never reaches the handler as a new node.
-  defp pusher_candidates(pg_group, new_nodes) do
-    pg_group
+  defp mark_ready(%__MODULE__{ready_pg_group: ready_pg_group} = state) do
+    :ok = Cluster.join(ready_pg_group)
+
+    %{state | ready?: true}
+  end
+
+  # The members whose own bootstrap has completed, except the nodes in the
+  # join batch being handled: a joiner may well have the smallest name, but it
+  # has nothing to push yet. A member still receiving its bootstrap has a
+  # partial cache, so it is not a candidate either. With no such member left
+  # (the cluster lost every bootstrapped node) every member is a candidate,
+  # which at least makes progress; this node is always a member and never a
+  # joiner to itself, so the fallback is never empty.
+  defp pusher_candidates(%__MODULE__{pg_group: pg_group, ready_pg_group: ready_pg_group}, new_nodes) do
+    case members_except(ready_pg_group, new_nodes) do
+      [] -> members_except(pg_group, new_nodes)
+      ready -> ready
+    end
+  end
+
+  defp members_except(group, excluded) do
+    group
     |> Cluster.pg_nodes()
-    |> Enum.reject(&MapSet.member?(new_nodes, &1))
+    |> Enum.reject(&MapSet.member?(excluded, &1))
   end
 
   # Simple leader election: the candidate with the smallest name (Erlang term
@@ -156,29 +188,6 @@ defmodule Nebulex.Adapters.Replicated.ClusterMonitor do
   # safe: `:put_new` is idempotent, and anti-entropy repairs any remaining
   # gaps.
   defp leader?(candidates), do: node() == Enum.min(candidates)
-
-  # The pushes for a join batch run in a supervised task, one target at a
-  # time, so this process never blocks on them and the pusher streams its
-  # cache to one node at a time, as it did when the pushes ran inline.
-  defp start_pushes(task_supervisor, new_nodes, adapter_meta) do
-    _ =
-      Task.Supervisor.start_child(task_supervisor, fn ->
-        Enum.each(new_nodes, &push_isolated(task_supervisor, &1, adapter_meta))
-      end)
-
-    :ok
-  end
-
-  # Each target gets its own unlinked task, awaited before the next one, so a
-  # failure (the target raising mid-bootstrap, a dropped connection, a
-  # timeout) is logged by the task and reported through the `:bootstrap`
-  # telemetry span's `:exception` event without stopping the pushes to the
-  # other joiners in the batch.
-  defp push_isolated(task_supervisor, new_node, adapter_meta) do
-    task_supervisor
-    |> Task.Supervisor.async_nolink(fn -> push_to_new_node(new_node, adapter_meta) end)
-    |> Task.yield(:infinity)
-  end
 
   defp maybe_reset_gc_interval(%{cache: cache} = adapter_meta, cluster_nodes) do
     if cache.__primary__().__adapter__() == Nebulex.Adapters.Local do

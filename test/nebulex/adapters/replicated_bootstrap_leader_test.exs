@@ -1,18 +1,20 @@
 defmodule Nebulex.Adapters.ReplicatedBootstrapLeaderTest do
-  # Covers how `Nebulex.Adapters.Replicated.ClusterMonitor` chooses the bootstrap pusher
-  # and keeps its cluster view when a push fails.
+  # Covers how `Nebulex.Adapters.Replicated.ClusterMonitor` chooses the bootstrap pusher, how
+  # `Nebulex.Adapters.Replicated.Bootstrapper` runs the pushes, and how both behave when a push
+  # fails.
   #
-  # The pusher is elected among the nodes `:pg` knows at the time of the join, not from
-  # the monitor's own view, so a stale view cannot elect extra pushers. The view is
-  # updated before the pushes run, and the pushes run in supervised tasks, so a push that
-  # raises (for example the target raising inside `apply_bootstrap_entries/2`) is reported
-  # through the `:bootstrap` telemetry span and never drops a joined node from the view.
+  # The pusher is elected among the `:pg` members whose own bootstrap has completed, at the
+  # time of the join, not from the monitor's own view, so a stale view or a half-filled cache
+  # cannot elect a pusher. The view is updated before the pushes run, and the pushes run one at
+  # a time in unlinked tasks, so a push that raises (for example the target raising inside
+  # `apply_bootstrap_entries/2`) is reported through the `:bootstrap` telemetry span, never drops
+  # a joined node from the view, and never stops the pushes to the other joiners.
   use Nebulex.NodeCase, async: false
 
   import Nebulex.CacheCase, only: [wait_until: 1]
 
   alias Nebulex.Adapters.Replicated
-  alias Nebulex.Adapters.Replicated.{ClusterMonitor, Replicator}
+  alias Nebulex.Adapters.Replicated.{Bootstrapper, ClusterMonitor, Replicator}
   alias Nebulex.Distributed.Cluster
   alias Nebulex.Distributed.TestCache.ReplicatedCache
   alias Nebulex.Telemetry
@@ -32,15 +34,16 @@ defmodule Nebulex.Adapters.ReplicatedBootstrapLeaderTest do
   @node3 :"node3@127.0.0.1"
   @node4 :"node4@127.0.0.1"
 
-  # The real Replicator with only `apply_bootstrap_entries/2` replaced by a raise. Stands in
-  # for any exception on the target during bootstrap, such as an ETS table deleted while its
-  # cache restarts. `RPC.call/5` re-raises remote exceptions on the pusher. Everything else
-  # (inbox/outbox processing) keeps working.
+  # The real Replicator with only `apply_bootstrap_entries/2` replaced by a short pause and a
+  # raise. Stands in for any exception on the target during bootstrap, such as an ETS table
+  # deleted while its cache restarts. `RPC.call/5` re-raises remote exceptions on the pusher.
+  # Everything else (inbox/outbox processing) keeps working.
   @replicator_source File.read!("lib/nebulex/adapters/replicated/replicator.ex")
   @raising_replicator String.replace(
                         @replicator_source,
                         "def apply_bootstrap_entries(adapter_meta, entries) do",
                         "def apply_bootstrap_entries(_adapter_meta, _entries) do\n" <>
+                          "    Process.sleep(300)\n" <>
                           "    raise \"target raised during bootstrap\"\n" <>
                           "  end\n\n" <>
                           "  def __real_apply_bootstrap_entries(adapter_meta, entries) do"
@@ -70,10 +73,10 @@ defmodule Nebulex.Adapters.ReplicatedBootstrapLeaderTest do
           pid when is_pid(pid) -> rpc(node, Supervisor, :stop, [pid, :normal, @timeout])
           _ -> :ok
         end
-      end
 
-      _ = rpc(@node4, :code, :purge, [Replicator])
-      _ = rpc(@node4, :code, :delete, [Replicator])
+        _ = rpc(node, :code, :purge, [Replicator])
+        _ = rpc(node, :code, :delete, [Replicator])
+      end
     end)
 
     # Give the pushers something to push, and wait for replication to land on them.
@@ -84,26 +87,32 @@ defmodule Nebulex.Adapters.ReplicatedBootstrapLeaderTest do
       assert primary_count(@node2) >= 1
     end)
 
-    [{Replicator, _binary}] = rpc(@node4, Code, :compile_string, [@raising_replicator])
+    # Every node finished its own bootstrap and is a pusher candidate.
+    %{adapter_meta: adapter_meta} = monitor_state(node())
 
-    {:ok, doomed_target: monitor_pid(@node4)}
+    wait_until(fn ->
+      assert Enum.sort(Cluster.pg_nodes(adapter_meta.ready_pg_group)) == Enum.sort(nodes)
+    end)
+
+    {:ok, adapter_meta: adapter_meta}
   end
 
   describe "handle_info/2 on a :join event" do
-    test "keeps every node in the batch in the view when a push raises", %{
-      doomed_target: doomed_target
-    } do
+    test "keeps every node in the batch in the view when a push raises" do
+      break_bootstrap_on(@node4)
+
       monitor = monitor_pid(@node1)
-      %{pg_ref: pg_ref, adapter_meta: %{pg_group: pg_group}} = monitor_state(@node1)
+      %{pg_ref: pg_ref, pg_group: pg_group} = monitor_state(@node1)
       node2_member = monitor_pid(@node2)
+      node4_member = monitor_pid(@node4)
 
       watch(@node1, :stop)
       watch(@node1, :exception)
 
       # Nodes 2 and 4 restart: their leaves are applied, then both rejoins arrive in one
       # :pg batch. The push to node4 raises.
-      send(monitor, {pg_ref, :leave, pg_group, [doomed_target, node2_member]})
-      send(monitor, {pg_ref, :join, pg_group, [doomed_target, node2_member]})
+      send(monitor, {pg_ref, :leave, pg_group, [node4_member, node2_member]})
+      send(monitor, {pg_ref, :join, pg_group, [node4_member, node2_member]})
 
       # The state is read with a call, so it is answered after both messages were handled.
       %{cluster_nodes: view} = monitor_state(@node1)
@@ -111,11 +120,11 @@ defmodule Nebulex.Adapters.ReplicatedBootstrapLeaderTest do
       assert MapSet.member?(view, @node2) == true
       assert MapSet.member?(view, @node4) == true
 
-      # The failure is reported, not swallowed, and the other push in the batch completes.
+      # The other push in the batch completes, the failure is reported, not swallowed.
+      assert_receive {@bootstrap_stop, _measurements, %{node: @node1, peer: @node2}}, @timeout
+
       assert_receive {@bootstrap_exception, _measurements, %{node: @node1, peer: @node4}},
                      @timeout
-
-      assert_receive {@bootstrap_stop, _measurements, %{node: @node1, peer: @node2}}, @timeout
 
       # The monitor is still alive and serving.
       assert monitor_pid(@node1) == monitor
@@ -125,7 +134,7 @@ defmodule Nebulex.Adapters.ReplicatedBootstrapLeaderTest do
     test "elects exactly one pusher from live membership even when a view is stale" do
       # node2 forgets node1 in its own view, the way a lost join batch would leave it.
       monitor = monitor_pid(@node2)
-      %{pg_ref: pg_ref, adapter_meta: %{pg_group: pg_group}} = monitor_state(@node2)
+      %{pg_ref: pg_ref, pg_group: pg_group} = monitor_state(@node2)
 
       send(monitor, {pg_ref, :leave, pg_group, [monitor_pid(@node1)]})
 
@@ -133,20 +142,10 @@ defmodule Nebulex.Adapters.ReplicatedBootstrapLeaderTest do
       assert MapSet.member?(view, @node1) == false
       assert Enum.min(view) == @node2
 
-      # Watch the bootstrap spans on both candidates.
       watch(@node1, :start)
       watch(@node2, :start)
 
-      # A genuine join: node3 restarts its cache.
-      :ok =
-        rpc(@node3, Supervisor, :stop, [
-          rpc(@node3, Process, :whereis, [@cache_name]),
-          :normal,
-          @timeout
-        ])
-
-      {:ok, _pid} =
-        start_cache(@node3, ReplicatedCache, name: @cache_name, replication: [interval: 100])
+      restart_cache(@node3)
 
       # The real leader pushes, node2 does not.
       assert_receive {@bootstrap_start, _measurements, %{node: @node1, peer: @node3}}, @timeout
@@ -156,9 +155,139 @@ defmodule Nebulex.Adapters.ReplicatedBootstrapLeaderTest do
       %{cluster_nodes: view} = monitor_state(@node2)
       assert MapSet.member?(view, @node3) == true
     end
+
+    test "does not elect a node whose own bootstrap has not completed", %{
+      adapter_meta: adapter_meta
+    } do
+      # node1 rejoins, but the push to it raises, so it never completes its bootstrap.
+      break_bootstrap_on(@node1)
+      watch(@node2, :exception)
+
+      restart_cache(@node1)
+
+      assert_receive {@bootstrap_exception, _measurements, %{node: @node2, peer: @node1}},
+                     @timeout
+
+      assert @node1 in Cluster.pg_nodes(adapter_meta.pg_group)
+      assert @node1 in Cluster.pg_nodes(adapter_meta.ready_pg_group) == false
+
+      # node1 sorts first, but node2 is the lowest bootstrapped node, so node2 pushes.
+      watch(@node1, :start)
+      watch(@node2, :start)
+
+      restart_cache(@node3)
+
+      assert_receive {@bootstrap_start, _measurements, %{node: @node2, peer: @node3}}, @timeout
+      refute_receive {@bootstrap_start, _measurements, %{node: @node1, peer: @node3}}, 500
+
+      # node3 completed its bootstrap and is a candidate again.
+      wait_until(fn -> assert @node3 in Cluster.pg_nodes(adapter_meta.ready_pg_group) end)
+    end
+
+    test "falls back to every member when no bootstrapped member is left", %{
+      adapter_meta: adapter_meta
+    } do
+      # Every node forgets it was bootstrapped.
+      for node <- [node() | Node.list()] do
+        :ok =
+          rpc(node, :pg, :leave, [
+            Cluster.pg_scope(),
+            adapter_meta.ready_pg_group,
+            monitor_pid(node)
+          ])
+      end
+
+      # The remote leaves reach the local `:pg` asynchronously.
+      wait_until(fn -> assert Cluster.pg_nodes(adapter_meta.ready_pg_group) == [] end)
+
+      watch(@node1, :start)
+
+      restart_cache(@node3)
+
+      # The lowest member pushes rather than nobody.
+      assert_receive {@bootstrap_start, _measurements, %{node: @node1, peer: @node3}}, @timeout
+    end
+  end
+
+  describe "bootstrap_completed/1" do
+    test "makes a restarted node a candidate again once its bootstrap finishes", %{
+      adapter_meta: adapter_meta
+    } do
+      watch(@node1, :stop)
+
+      # The local node restarts its cache: it is not alone, so it is bootstrapped by the
+      # leader and only then rejoins the candidates.
+      :ok = ReplicatedCache.stop()
+      {:ok, _pid} = ReplicatedCache.start_link(name: @cache_name, replication: [interval: 100])
+
+      assert_receive {@bootstrap_stop, _measurements, %{node: @node1, peer: peer}}, @timeout
+      assert peer == node()
+
+      wait_until(fn ->
+        assert monitor_state(node()).ready? == true
+        assert node() in Cluster.pg_nodes(adapter_meta.ready_pg_group)
+      end)
+
+      # A repeated completion changes nothing.
+      :ok = ClusterMonitor.bootstrap_completed(adapter_meta)
+
+      assert monitor_state(node()).ready? == true
+    end
+  end
+
+  describe "Bootstrapper.push/2" do
+    test "pushes one joiner at a time, isolates failures, and skips nodes that left", %{
+      adapter_meta: adapter_meta
+    } do
+      break_bootstrap_on(@node4)
+
+      me = node()
+      gone = :"gone@127.0.0.1"
+
+      watch(me, :start)
+      watch(me, :stop)
+      watch(me, :exception)
+
+      # node4 raises after a pause; node3 arrives while that push is in flight and waits its
+      # turn; `gone` is not a member any more and is listed twice.
+      :ok = Bootstrapper.push(adapter_meta, [@node4])
+      :ok = Bootstrapper.push(adapter_meta, [@node3, gone, gone])
+
+      assert_receive {@bootstrap_start, _measurements, %{node: ^me, peer: @node4}}, @timeout
+      refute_received {@bootstrap_start, _measurements, %{node: ^me, peer: @node3}}
+
+      assert_receive {@bootstrap_exception, _measurements, %{node: ^me, peer: @node4}},
+                     @timeout
+
+      assert_receive {@bootstrap_start, _measurements, %{node: ^me, peer: @node3}}, @timeout
+      assert_receive {@bootstrap_stop, _measurements, %{node: ^me, peer: @node3}}, @timeout
+      refute_receive {@bootstrap_start, _measurements, %{node: ^me, peer: ^gone}}, 500
+
+      # Unrelated messages are ignored.
+      bootstrapper = Process.whereis(Bootstrapper.server_name(adapter_meta))
+      send(bootstrapper, :unrelated)
+
+      assert %{in_flight: nil} = :sys.get_state(bootstrapper)
+    end
   end
 
   ## Helpers
+
+  defp break_bootstrap_on(node) do
+    [{Replicator, _binary}] = rpc(node, Code, :compile_string, [@raising_replicator])
+
+    :ok
+  end
+
+  defp restart_cache(node) do
+    :ok =
+      rpc(node, Supervisor, :stop, [rpc(node, Process, :whereis, [@cache_name]), :normal, @timeout])
+
+    {:ok, _pid} =
+      start_cache(node, ReplicatedCache, name: @cache_name, replication: [interval: 100])
+
+    :ok
+  end
 
   defp watch(node, suffix) do
     :ok =

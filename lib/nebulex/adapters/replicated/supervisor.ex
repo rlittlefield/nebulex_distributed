@@ -3,7 +3,7 @@ defmodule Nebulex.Adapters.Replicated.Supervisor do
 
   use Supervisor
 
-  alias Nebulex.Adapters.Replicated.{AntiEntropy, ClusterMonitor, Replicator}
+  alias Nebulex.Adapters.Replicated.{AntiEntropy, Bootstrapper, ClusterMonitor, Replicator}
   alias Tidefall.HashMap, as: HM
 
   ## API
@@ -38,7 +38,8 @@ defmodule Nebulex.Adapters.Replicated.Supervisor do
            )},
           id: adapter_meta.outbox
         ),
-        {Task.Supervisor, name: ClusterMonitor.task_supervisor_name(adapter_meta)},
+        {Task.Supervisor, name: Bootstrapper.task_supervisor_name(adapter_meta)},
+        {Bootstrapper, adapter_meta},
         {ClusterMonitor, adapter_meta}
       ] ++ maybe_anti_entropy(adapter_meta)
 
