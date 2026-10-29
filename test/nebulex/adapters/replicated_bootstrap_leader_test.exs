@@ -382,8 +382,9 @@ defmodule Nebulex.Adapters.ReplicatedBootstrapLeaderTest do
       watch(me, :stop)
       watch(me, :exception)
 
-      # node4 raises after a pause; node3 and node2 join while that push is in flight and
-      # wait their turn; node4 and node3 restart again meanwhile.
+      # node4 raises after a pause and restarts while that push is in flight, so it is pushed
+      # once more; node3 and node2 join meanwhile and wait their turn; node3 restarts while
+      # still queued, which changes nothing.
       send(monitor, {pg_ref, :leave, pg_group, [node3_member, node4_member]})
       send(monitor, {pg_ref, :join, pg_group, [node4_member]})
       send(monitor, {pg_ref, :leave, pg_group, [node4_member]})
@@ -391,6 +392,12 @@ defmodule Nebulex.Adapters.ReplicatedBootstrapLeaderTest do
       send(monitor, {pg_ref, :join, pg_group, [node3_member, node2_member]})
       send(monitor, {pg_ref, :leave, pg_group, [node3_member]})
       send(monitor, {pg_ref, :join, pg_group, [node3_member]})
+
+      assert_receive {@bootstrap_start, _measurements, %{node: ^me, peer: @node4}}, @timeout
+      refute_received {@bootstrap_start, _measurements, %{node: ^me, peer: @node3}}
+
+      assert_receive {@bootstrap_exception, _measurements, %{node: ^me, peer: @node4}},
+                     @timeout
 
       assert_receive {@bootstrap_start, _measurements, %{node: ^me, peer: @node4}}, @timeout
       refute_received {@bootstrap_start, _measurements, %{node: ^me, peer: @node3}}

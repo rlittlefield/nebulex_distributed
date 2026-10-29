@@ -243,10 +243,12 @@ defmodule Nebulex.Adapters.Replicated.ClusterMonitor do
   defp leader?([]), do: false
   defp leader?(candidates), do: node() == Enum.min(candidates)
 
-  # A node that leaves and rejoins while it is still queued or in flight is
-  # pushed once
-  defp enqueue(node, %__MODULE__{queue: queue, queued: queued, in_flight: in_flight} = state) do
-    if MapSet.member?(queued, node) or match?({^node, _ref}, in_flight) do
+  # A node that leaves and rejoins while it is still queued is pushed once. One
+  # that rejoins while its push is in flight is queued again: that push may be
+  # streaming to the cache that just went away, and if it fails nothing else
+  # would push to the restarted node.
+  defp enqueue(node, %__MODULE__{queue: queue, queued: queued} = state) do
+    if MapSet.member?(queued, node) do
       state
     else
       %{state | queue: :queue.in(node, queue), queued: MapSet.put(queued, node)}
